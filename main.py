@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import os
 import io
@@ -14,7 +15,8 @@ FILE_URL = "https://api.telegram.org/file/bot{token}/{file_path}"
 
 REQUEST_TIMEOUT = 30  
 MAX_RETRIES = 5
-RETRY_DELAY = 3
+RETRY_DELAY = 3  
+
 
 def _request_with_retry(method, url, **kwargs):
     last_exc = None
@@ -23,7 +25,7 @@ def _request_with_retry(method, url, **kwargs):
             resp = method(url, timeout=REQUEST_TIMEOUT, **kwargs)
             resp.raise_for_status()
             return resp
-        except (requests.exceptions.RequestException,) as e:
+        except requests.exceptions.RequestException as e:
             last_exc = e
             if attempt < MAX_RETRIES:
                 wait = RETRY_DELAY * attempt
@@ -95,14 +97,7 @@ def save_tgs_as_gif(raw_bytes, out_path):
         os.remove(tmp_in_path)
 
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python telegram_stickers_to_png.py <BOT_TOKEN> <PACK_SHORT_NAME>")
-        sys.exit(1)
-
-    token = sys.argv[1]
-    pack_name = sys.argv[2]
-
+def run_export(token, pack_name):
     out_dir = f"stickers_{pack_name}"
     os.makedirs(out_dir, exist_ok=True)
 
@@ -149,6 +144,17 @@ def main():
         print(f"\n{len(failed)} stickers ont échoué :")
         for i, emoji, err in failed:
             print(f"  - #{i} {emoji} : {err}")
+
+    return out_dir, failed
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python main.py <BOT_TOKEN> <PACK_SHORT_NAME>")
+        print("(ou utilise run.py / setup.sh pour la version interactive)")
+        sys.exit(1)
+
+    run_export(sys.argv[1], sys.argv[2])
 
 
 if __name__ == "__main__":
