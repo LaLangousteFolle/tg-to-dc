@@ -4,22 +4,22 @@ import sys
 import os
 import io
 import time
+import math
+import shutil
 import subprocess
 import tempfile
-
 import requests
 from PIL import Image
 
 API_URL = "https://api.telegram.org/bot{token}/{method}"
 FILE_URL = "https://api.telegram.org/file/bot{token}/{file_path}"
-
-REQUEST_TIMEOUT = 30  
+REQUEST_TIMEOUT = 30
 MAX_RETRIES = 5
-RETRY_DELAY = 3  
-
+RETRY_DELAY = 3
 
 def _request_with_retry(method, url, **kwargs):
     last_exc = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = method(url, timeout=REQUEST_TIMEOUT, **kwargs)
@@ -29,41 +29,41 @@ def _request_with_retry(method, url, **kwargs):
             last_exc = e
             if attempt < MAX_RETRIES:
                 wait = RETRY_DELAY * attempt
-                print(f"    (réseau : {e.__class__.__name__}, retry {attempt}/{MAX_RETRIES} dans {wait}s...)")
+                print(f" (réseau : {e.__class__.__name__}, retry {attempt}/{MAX_RETRIES} dans {wait}s...)")
                 time.sleep(wait)
             else:
                 raise
-    raise last_exc
 
+    raise last_exc
 
 def get_sticker_set(token, pack_name):
     url = API_URL.format(token=token, method="getStickerSet")
     resp = _request_with_retry(requests.get, url, params={"name": pack_name})
     data = resp.json()
+
     if not data.get("ok"):
         raise RuntimeError(f"Erreur API Telegram : {data}")
-    return data["result"]
 
+    return data["result"]
 
 def get_file_path(token, file_id):
     url = API_URL.format(token=token, method="getFile")
     resp = _request_with_retry(requests.get, url, params={"file_id": file_id})
     data = resp.json()
+
     if not data.get("ok"):
         raise RuntimeError(f"Erreur getFile : {data}")
-    return data["result"]["file_path"]
 
+    return data["result"]["file_path"]
 
 def download_file(token, file_path):
     url = FILE_URL.format(token=token, file_path=file_path)
     resp = _request_with_retry(requests.get, url)
     return resp.content
 
-
 def save_static_png(raw_bytes, out_path):
     img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
     img.save(out_path, "PNG")
-
 
 def save_webm_as_gif(raw_bytes, out_path):
     with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp_in:
@@ -81,29 +81,89 @@ def save_webm_as_gif(raw_bytes, out_path):
     finally:
         os.remove(tmp_in_path)
 
-
 def save_tgs_as_gif(raw_bytes, out_path):
     from lottie.parsers.tgs import parse_tgs
-    from lottie.exporters.gif import export_gif
+    from lottie.exporters.cairo import export_png
+
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg est requis pour exporter les stickers TGS en GIF")
 
     with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp_in:
         tmp_in.write(raw_bytes)
         tmp_in_path = tmp_in.name
 
+    frames_dir = tempfile.mkdtemp(prefix="tg_to_dc_frames_")
+
     try:
         animation = parse_tgs(tmp_in_path)
-        export_gif(animation, out_path)
-    finally:
-        os.remove(tmp_in_path)
 
+        start_frame = math.floor(animation.in_point)
+        end_frame = math.ceil(animation.out_point)
+
+        if end_frame <= start_frame:
+            raise RuntimeError("Animation TGS vide")
+
+        frame_rate = float(animation.frame_rate)
+
+        if not math.isfinite(frame_rate) or frame_rate <= 0:
+            raise RuntimeError(f"Framerate TGS invalide : {frame_rate}")
+
+        frame_paths = []
+
+        for frame_number in range(start_frame, end_frame):
+            frame_path = os.path.join(frames_dir, f"frame_{frame_number - start_frame:06d}.png")
+            export_png(animation, frame_path, frame=frame_number)
+            frame_paths.append(frame_path)
+
+        if not frame_paths:
+            raise RuntimeError("Aucune frame générée")
+
+        palette_path = os.path.join(frames_dir, "palette.png")
+
+        palette_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", f"{frame_rate:.8f}",
+            "-i", os.path.join(frames_dir, "frame_%06d.png"),
+            "-vf", "palettegen=stats_mode=diff:reserve_transparent=1",
+            palette_path,
+        ]
+
+        subprocess.run(
+            palette_cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        gif_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", f"{frame_rate:.8f}",
+            "-i", os.path.join(frames_dir, "frame_%06d.png"),
+            "-i", palette_path,
+            "-lavfi", "[0:v][1:v]paletteuse=dither=sierra2_4a:alpha_threshold=128",
+            "-loop", "0",
+            out_path,
+        ]
+
+        subprocess.run(
+            gif_cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        os.remove(tmp_in_path)
 
 def run_export(token, pack_name):
     out_dir = f"stickers_{pack_name}"
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"Récupération du pack '{pack_name}'...")
+
     sticker_set = get_sticker_set(token, pack_name)
     stickers = sticker_set["stickers"]
+
     print(f"{len(stickers)} stickers trouvés.")
 
     failed = []
@@ -115,12 +175,13 @@ def run_export(token, pack_name):
         is_video = sticker.get("is_video", False)
 
         safe_emoji = (emoji or "sticker").replace("/", "_")
+
         ext = "gif" if (is_video or is_animated) else "png"
         out_name = f"{i:03d}_{safe_emoji}.{ext}"
         out_path = os.path.join(out_dir, out_name)
 
         if os.path.exists(out_path):
-            print(f"  [{i+1}/{len(stickers)}] -> {out_name} (déjà fait, skip)")
+            print(f" [{i+1}/{len(stickers)}] -> {out_name} (déjà fait, skip)")
             continue
 
         try:
@@ -134,19 +195,19 @@ def run_export(token, pack_name):
             else:
                 save_static_png(raw_bytes, out_path)
 
-            print(f"  [{i+1}/{len(stickers)}] -> {out_name}")
+            print(f" [{i+1}/{len(stickers)}] -> {out_name}")
         except Exception as e:
-            print(f"  [{i+1}/{len(stickers)}] ECHEC ({emoji}) : {e}")
+            print(f" [{i+1}/{len(stickers)}] ECHEC ({emoji}) : {e}")
             failed.append((i, emoji, str(e)))
 
     print(f"\nTerminé. Fichiers dans le dossier : {out_dir}/")
+
     if failed:
         print(f"\n{len(failed)} stickers ont échoué :")
         for i, emoji, err in failed:
-            print(f"  - #{i} {emoji} : {err}")
+            print(f" - #{i} {emoji} : {err}")
 
     return out_dir, failed
-
 
 def main():
     if len(sys.argv) != 3:
@@ -155,7 +216,6 @@ def main():
         sys.exit(1)
 
     run_export(sys.argv[1], sys.argv[2])
-
 
 if __name__ == "__main__":
     main()

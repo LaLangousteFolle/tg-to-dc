@@ -1,18 +1,37 @@
 import { addChatBarButton, ChatBarButton, removeChatBarButton } from "@api/ChatButtons";
+
 import { definePluginSettings } from "@api/Settings";
+
 import { Devs } from "@utils/constants";
+
 import { getCurrentChannel } from "@utils/discord";
 import { ModalCloseButton, ModalContent, ModalHeader, ModalRoot, ModalSize, openModal } from "@utils/modal";
+
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { Button, DraftType, Forms, TextInput, UploadHandler, useEffect, useMemo, useState } from "@webpack/common";
+
+import { Button, DraftType, Forms, TextInput, UploadHandler, useEffect, useMemo, useRef, useState } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.LocalStickers as PluginNative<typeof import("./native")>;
 
 const ALL_FILTER = "__ALL__";
+const FAVORITES_FILTER = "__FAVORITES__";
+const FAVORITES_KEY = "LocalStickers.favorites";
+const MAX_CACHE_SIZE = 80;
+const MAX_STICKER_SIZE = 1024;
 
 interface StickerCategory {
     name: string;
     files: string[];
+}
+
+interface StickerEntry {
+    name: string;
+    relPath: string;
+}
+
+interface LoadedSticker {
+    dataUrl: string;
+    file: File;
 }
 
 const EXT_MIME: Record<string, string> = {
@@ -23,6 +42,8 @@ const EXT_MIME: Record<string, string> = {
     ".webp": "image/webp",
 };
 
+const stickerCache = new Map<string, LoadedSticker>();
+
 function extOf(name: string): string {
     const i = name.lastIndexOf(".");
     return i === -1 ? "" : name.slice(i).toLowerCase();
@@ -30,63 +51,297 @@ function extOf(name: string): string {
 
 function prettyCategoryName(name: string): string {
     if (name === "(racine)") return "Divers";
+
     const last = name.split(/[/\\]/).pop() ?? name;
+
     return last.replace(/^stickers[_-]?/i, "").replace(/_/g, " ") || last;
 }
 
 function base64ToBytes(base64: string): Uint8Array {
     const chars = atob(base64);
     const bytes = new Uint8Array(chars.length);
+
     for (let i = 0; i < chars.length; i++) bytes[i] = chars.charCodeAt(i);
+
     return bytes;
 }
 
-function loadImageFromFile(file: File): Promise<HTMLImageElement> {
-    const url = URL.createObjectURL(file);
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => {
-            URL.revokeObjectURL(url);
-            resolve(img);
-        };
-        img.onerror = e => reject(e);
-        img.src = url;
-    });
+function getCacheKey(folder: string, relPath: string): string {
+    return `${folder}\0${relPath}`;
 }
 
-async function resizeToStickerSize(file: File, size: number): Promise<File> {
-    const img = await loadImageFromFile(file);
-    const canvas = document.createElement("canvas");
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext("2d")!;
-    const scale = Math.min(size / img.width, size / img.height);
-    const w = img.width * scale;
-    const h = img.height * scale;
-    ctx.clearRect(0, 0, size, size);
-    ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
-    return new Promise(resolve => {
-        canvas.toBlob(blob => {
-            resolve(new File([blob!], file.name.replace(/\.\w+$/, ".png"), { type: "image/png" }));
-        }, "image/png");
-    });
+function getFavorites(): string[] {
+    try {
+        const value = JSON.parse(localStorage.getItem(FAVORITES_KEY) ?? "[]");
+        return Array.isArray(value) ? value.filter(value => typeof value === "string") : [];
+    } catch {
+        return [];
+    }
+}
+
+function setFavorites(favorites: string[]): void {
+    localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites));
+}
+
+function toggleFavorite(relPath: string): boolean {
+    const favorites = getFavorites();
+    const index = favorites.indexOf(relPath);
+
+    if (index === -1) {
+        favorites.push(relPath);
+        setFavorites(favorites);
+        return true;
+    }
+
+    favorites.splice(index, 1);
+    setFavorites(favorites);
+    return false;
 }
 
 function getChatInputEditor(): HTMLElement | null {
     const candidates = Array.from(document.querySelectorAll('[data-slate-editor="true"]')) as HTMLElement[];
     const visible = candidates.filter(el => el.offsetParent !== null);
+
     if (!visible.length) return null;
+
     visible.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
     return visible[0];
 }
 
 function sendViaEnterKey() {
     const editor = getChatInputEditor();
+
     if (!editor) return;
+
     editor.focus();
-    const opts = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true };
+
+    const opts = {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+    };
+
     editor.dispatchEvent(new KeyboardEvent("keydown", opts));
     editor.dispatchEvent(new KeyboardEvent("keyup", opts));
+}
+
+async function loadImageFromFile(file: File): Promise<HTMLImageElement> {
+    const url = URL.createObjectURL(file);
+
+    try {
+        return await new Promise((resolve, reject) => {
+            const img = new Image();
+
+            img.onload = () => resolve(img);
+            img.onerror = reject;
+            img.src = url;
+        });
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+
+async function resizeToStickerSize(file: File, requestedSize: number): Promise<File> {
+    const size = Math.max(32, Math.min(MAX_STICKER_SIZE, Math.round(requestedSize)));
+    const img = await loadImageFromFile(file);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+
+    const ctx = canvas.getContext("2d");
+
+    if (!ctx) throw new Error("Impossible de créer le contexte canvas");
+
+    const scale = Math.min(size / img.width, size / img.height);
+    const width = img.width * scale;
+    const height = img.height * scale;
+
+    ctx.clearRect(0, 0, size, size);
+    ctx.drawImage(img, (size - width) / 2, (size - height) / 2, width, height);
+
+    const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(result => {
+            if (result) resolve(result);
+            else reject(new Error("Impossible de convertir le sticker"));
+        }, "image/png");
+    });
+
+    return new File([blob], file.name.replace(/\.\w+$/, ".png"), { type: "image/png" });
+}
+
+async function loadSticker(folder: string, entry: StickerEntry): Promise<LoadedSticker> {
+    const key = getCacheKey(folder, entry.relPath);
+    const cached = stickerCache.get(key);
+
+    if (cached) {
+        stickerCache.delete(key);
+        stickerCache.set(key, cached);
+        return cached;
+    }
+
+    const base64 = await Native.readSticker(folder, entry.relPath);
+    const mime = EXT_MIME[extOf(entry.name)] ?? "application/octet-stream";
+    const bytes = base64ToBytes(base64);
+    const file = new File([bytes.buffer as ArrayBuffer], entry.name, { type: mime });
+    const loaded = {
+        dataUrl: `data:${mime};base64,${base64}`,
+        file,
+    };
+
+    stickerCache.set(key, loaded);
+
+    while (stickerCache.size > MAX_CACHE_SIZE) {
+        const oldest = stickerCache.keys().next().value;
+
+        if (oldest === undefined) break;
+
+        stickerCache.delete(oldest);
+    }
+
+    return loaded;
+}
+
+function clearFolderCache(folder: string): void {
+    for (const key of stickerCache.keys()) {
+        if (key.startsWith(`${folder}\0`)) stickerCache.delete(key);
+    }
+}
+
+function StickerImage({
+    folder,
+    entry,
+    onClick,
+    onToggleFavorite,
+    favorite,
+}: {
+    folder: string;
+    entry: StickerEntry;
+    onClick: () => void;
+    onToggleFavorite: () => void;
+    favorite: boolean;
+}) {
+    const containerRef = useRef<HTMLDivElement>(null);
+    const [src, setSrc] = useState<string>();
+    const [error, setError] = useState(false);
+
+    useEffect(() => {
+        const element = containerRef.current;
+
+        if (!element) return;
+
+        let cancelled = false;
+
+        const load = async () => {
+            try {
+                const loaded = await loadSticker(folder, entry);
+
+                if (!cancelled) setSrc(loaded.dataUrl);
+            } catch (e) {
+                if (!cancelled) {
+                    console.error("[LocalStickers] Impossible de charger", entry.relPath, e);
+                    setError(true);
+                }
+            }
+        };
+
+        if (!("IntersectionObserver" in window)) {
+            load();
+            return () => {
+                cancelled = true;
+            };
+        }
+
+        const observer = new IntersectionObserver(entries => {
+            if (!entries.some(entry => entry.isIntersecting)) return;
+
+            observer.disconnect();
+            load();
+        }, { rootMargin: "240px" });
+
+        observer.observe(element);
+
+        return () => {
+            cancelled = true;
+            observer.disconnect();
+        };
+    }, [folder, entry.relPath]);
+
+    return (
+        <div
+            ref={containerRef}
+            style={{
+                position: "relative",
+                width: 80,
+                height: 80,
+                borderRadius: 8,
+                background: "var(--background-secondary)",
+                overflow: "hidden",
+            }}
+        >
+            {src ? (
+                <img
+                    src={src}
+                    alt={entry.name}
+                    title={entry.name}
+                    onClick={onClick}
+                    draggable={false}
+                    style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        cursor: "pointer",
+                    }}
+                />
+            ) : (
+                <div
+                    style={{
+                        width: "100%",
+                        height: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: error ? "var(--text-danger)" : "var(--text-muted)",
+                        fontSize: 20,
+                    }}
+                >
+                    {error ? "!" : "…"}
+                </div>
+            )}
+
+            {src && (
+                <button
+                    type="button"
+                    title={favorite ? "Retirer des favoris" : "Ajouter aux favoris"}
+                    onClick={event => {
+                        event.stopPropagation();
+                        onToggleFavorite();
+                    }}
+                    style={{
+                        position: "absolute",
+                        top: 3,
+                        right: 3,
+                        width: 24,
+                        height: 24,
+                        padding: 0,
+                        border: 0,
+                        borderRadius: 6,
+                        cursor: "pointer",
+                        background: "var(--background-floating)",
+                        color: favorite ? "var(--text-warning)" : "var(--text-muted)",
+                        opacity: 0.9,
+                        fontSize: 15,
+                    }}
+                >
+                    {favorite ? "★" : "☆"}
+                </button>
+            )}
+        </div>
+    );
 }
 
 const settings = definePluginSettings({
@@ -102,7 +357,10 @@ const settings = definePluginSettings({
             <Button
                 onClick={async () => {
                     const folder = await Native.pickFolder();
-                    if (folder) settings.store.folderPath = folder;
+
+                    if (folder) {
+                        settings.store.folderPath = folder;
+                    }
                 }}
             >
                 Choisir un dossier...
@@ -121,103 +379,170 @@ const settings = definePluginSettings({
     },
 });
 
-interface StickerEntry {
-    name: string;
-    relPath: string;
-    dataUrl: string;
-    file: File;
-}
-
-function StickerPickerModal({ modalProps }: { modalProps: any; }) {
+function StickerPickerModal({ modalProps }: { modalProps: any }) {
     const [categories, setCategories] = useState<StickerCategory[]>([]);
-    const [cache, setCache] = useState<Record<string, StickerEntry[]>>({});
     const [loading, setLoading] = useState(true);
-    const [filter, setFilter] = useState<string>(ALL_FILTER);
+    const [refreshing, setRefreshing] = useState(false);
+    const [filter, setFilter] = useState(ALL_FILTER);
     const [search, setSearch] = useState("");
+    const [favorites, setFavoritesState] = useState<string[]>(getFavorites);
 
     const folder = settings.store.folderPath;
 
-    useEffect(() => {
-        (async () => {
-            if (!folder) {
-                setLoading(false);
-                return;
-            }
-            const cats: StickerCategory[] = await Native.listStickerCategories(folder);
+    const refresh = async () => {
+        if (!folder) {
+            setCategories([]);
+            setLoading(false);
+            return;
+        }
+
+        setRefreshing(true);
+
+        try {
+            clearFolderCache(folder);
+            const cats = await Native.listStickerCategories(folder);
             setCategories(cats);
 
-            const nextCache: Record<string, StickerEntry[]> = {};
-            await Promise.all(
-                cats.map(async cat => {
-                    const entries: StickerEntry[] = [];
-                    for (const relPath of cat.files) {
-                        try {
-                            const base64 = await Native.readSticker(folder, relPath);
-                            const fileName = relPath.split(/[/\\]/).pop()!;
-                            const mime = EXT_MIME[extOf(fileName)] ?? "application/octet-stream";
-                            const bytes = base64ToBytes(base64);
-                            const file = new File([bytes.buffer as ArrayBuffer], fileName, { type: mime });
-                            entries.push({ name: fileName, relPath, dataUrl: `data:${mime};base64,${base64}`, file });
-                        } catch (e) {
-                            console.error("[LocalStickers] Impossible de lire", relPath, e);
-                        }
-                    }
-                    nextCache[cat.name] = entries;
-                })
-            );
-            setCache(nextCache);
+            if (filter !== ALL_FILTER && filter !== FAVORITES_FILTER && !cats.some(cat => cat.name === filter)) {
+                setFilter(ALL_FILTER);
+            }
+        } catch (e) {
+            console.error("[LocalStickers] Impossible de scanner le dossier", e);
+            setCategories([]);
+        } finally {
             setLoading(false);
-        })();
+            setRefreshing(false);
+        }
+    };
+
+    useEffect(() => {
+        refresh();
     }, [folder]);
 
+    const favoriteSet = useMemo(() => new Set(favorites), [favorites]);
+
+    const allEntries = useMemo(() => {
+        return categories.flatMap(category =>
+            category.files.map(relPath => ({
+                name: relPath.split(/[/\\]/).pop() ?? relPath,
+                relPath,
+                category: category.name,
+            })),
+        );
+    }, [categories]);
+
     const groups = useMemo(() => {
-        const relevant = filter === ALL_FILTER ? categories : categories.filter(c => c.name === filter);
-        const lowerSearch = search.toLowerCase();
+        const lowerSearch = search.trim().toLocaleLowerCase();
+
+        let relevant = categories;
+
+        if (filter === FAVORITES_FILTER) {
+            const favoriteEntries = allEntries
+                .filter(entry => favoriteSet.has(entry.relPath))
+                .filter(entry => !lowerSearch || entry.name.toLocaleLowerCase().includes(lowerSearch));
+
+            return favoriteEntries.length
+                ? [{
+                    category: { name: FAVORITES_FILTER, files: favoriteEntries.map(entry => entry.relPath) },
+                    entries: favoriteEntries.map(entry => ({
+                        name: entry.name,
+                        relPath: entry.relPath,
+                    })),
+                }]
+                : [];
+        }
+
+        if (filter !== ALL_FILTER) {
+            relevant = categories.filter(category => category.name === filter);
+        }
+
         return relevant
-            .map(cat => ({
-                category: cat,
-                entries: (cache[cat.name] ?? []).filter(e => e.name.toLowerCase().includes(lowerSearch)),
+            .map(category => ({
+                category,
+                entries: category.files
+                    .map(relPath => ({
+                        name: relPath.split(/[/\\]/).pop() ?? relPath,
+                        relPath,
+                    }))
+                    .filter(entry => !lowerSearch || entry.name.toLocaleLowerCase().includes(lowerSearch)),
             }))
-            .filter(g => g.entries.length > 0 || !search);
-    }, [categories, cache, filter, search]);
+            .filter(group => group.entries.length > 0 || !search.trim());
+    }, [categories, allEntries, favoriteSet, filter, search]);
+
+    const toggleFavorite = (relPath: string) => {
+        const next = getFavorites();
+        const index = next.indexOf(relPath);
+
+        if (index === -1) next.push(relPath);
+        else next.splice(index, 1);
+
+        setFavorites(next);
+        setFavoritesState(next);
+    };
 
     async function send(entry: StickerEntry) {
         const channel = getCurrentChannel();
+
         if (!channel) return;
 
-        const isGif = extOf(entry.name) === ".gif";
-        const size = settings.store.stickerSize || 320;
-        const finalFile = isGif ? entry.file : await resizeToStickerSize(entry.file, size);
+        try {
+            const loaded = await loadSticker(folder, entry);
+            const isGif = extOf(entry.name) === ".gif";
+            const size = settings.store.stickerSize || 320;
+            const finalFile = isGif ? loaded.file : await resizeToStickerSize(loaded.file, size);
 
-        modalProps.onClose();
+            modalProps.onClose();
 
-        setTimeout(() => {
-            UploadHandler.promptToUpload([finalFile], channel, DraftType.ChannelMessage);
+            setTimeout(() => {
+                UploadHandler.promptToUpload([finalFile], channel, DraftType.ChannelMessage);
 
-            if (settings.store.autoSend) {
-                setTimeout(sendViaEnterKey, 300);
-            }
-        }, 10);
+                if (settings.store.autoSend) {
+                    setTimeout(sendViaEnterKey, 300);
+                }
+            }, 10);
+        } catch (e) {
+            console.error("[LocalStickers] Impossible d'envoyer", entry.relPath, e);
+        }
     }
 
     return (
         <ModalRoot {...modalProps} size={ModalSize.MEDIUM}>
             <ModalHeader>
                 <Forms.FormTitle tag="h2" style={{ flexGrow: 1 }}>Mes stickers</Forms.FormTitle>
+
+                <Button
+                    size={Button.Sizes.SMALL}
+                    look={Button.Looks.OUTLINED}
+                    disabled={refreshing}
+                    onClick={refresh}
+                    style={{ marginRight: 8 }}
+                >
+                    {refreshing ? "..." : "Actualiser"}
+                </Button>
+
                 <ModalCloseButton onClick={modalProps.onClose} />
             </ModalHeader>
+
             <ModalContent>
                 {!folder && (
                     <Forms.FormText style={{ margin: "12px 0" }}>
                         Configure le dossier des stickers dans les paramètres du plugin (Vencord → Plugins → LocalStickers).
                     </Forms.FormText>
                 )}
-                {loading && folder && <Forms.FormText style={{ margin: "12px 0" }}>Chargement des stickers...</Forms.FormText>}
-                {!loading && folder && categories.length === 0 && (
-                    <Forms.FormText style={{ margin: "12px 0" }}>Aucun sticker trouvé dans ce dossier (ni ses sous-dossiers).</Forms.FormText>
+
+                {loading && folder && (
+                    <Forms.FormText style={{ margin: "12px 0" }}>
+                        Analyse du dossier...
+                    </Forms.FormText>
                 )}
 
-                {!loading && categories.length > 0 && (
+                {!loading && folder && categories.length === 0 && (
+                    <Forms.FormText style={{ margin: "12px 0" }}>
+                        Aucun sticker trouvé dans ce dossier (ni ses sous-dossiers).
+                    </Forms.FormText>
+                )}
+
+                {!loading && folder && categories.length > 0 && (
                     <>
                         <div
                             style={{
@@ -234,16 +559,25 @@ function StickerPickerModal({ modalProps }: { modalProps: any; }) {
                                 look={filter === ALL_FILTER ? Button.Looks.FILLED : Button.Looks.OUTLINED}
                                 onClick={() => setFilter(ALL_FILTER)}
                             >
-                                Tout
+                                Tout ({allEntries.length})
                             </Button>
-                            {categories.map(cat => (
+
+                            <Button
+                                size={Button.Sizes.SMALL}
+                                look={filter === FAVORITES_FILTER ? Button.Looks.FILLED : Button.Looks.OUTLINED}
+                                onClick={() => setFilter(FAVORITES_FILTER)}
+                            >
+                                ★ Favoris ({favorites.length})
+                            </Button>
+
+                            {categories.map(category => (
                                 <Button
-                                    key={cat.name}
+                                    key={category.name}
                                     size={Button.Sizes.SMALL}
-                                    look={filter === cat.name ? Button.Looks.FILLED : Button.Looks.OUTLINED}
-                                    onClick={() => setFilter(cat.name)}
+                                    look={filter === category.name ? Button.Looks.FILLED : Button.Looks.OUTLINED}
+                                    onClick={() => setFilter(category.name)}
                                 >
-                                    {prettyCategoryName(cat.name)} ({cat.files.length})
+                                    {prettyCategoryName(category.name)} ({category.files.length})
                                 </Button>
                             ))}
                         </div>
@@ -255,23 +589,28 @@ function StickerPickerModal({ modalProps }: { modalProps: any; }) {
                             style={{ marginBottom: 12 }}
                         />
 
-                        {groups.length === 0 && <Forms.FormText>Aucun sticker ne correspond.</Forms.FormText>}
+                        {groups.length === 0 && (
+                            <Forms.FormText>Aucun sticker ne correspond.</Forms.FormText>
+                        )}
 
                         <div style={{ maxHeight: 420, overflowY: "auto", paddingBottom: 12 }}>
                             {groups.map(({ category, entries }) => (
                                 <div key={category.name} style={{ marginBottom: 20 }}>
-                                    <div
-                                        style={{
-                                            marginBottom: 8,
-                                            textTransform: "uppercase",
-                                            fontWeight: 700,
-                                            fontSize: 12,
-                                            letterSpacing: "0.02em",
-                                            color: "#f2f3f5",
-                                        }}
-                                    >
-                                        {prettyCategoryName(category.name)}
-                                    </div>
+                                    {category.name !== FAVORITES_FILTER && (
+                                        <div
+                                            style={{
+                                                marginBottom: 8,
+                                                textTransform: "uppercase",
+                                                fontWeight: 700,
+                                                fontSize: 12,
+                                                letterSpacing: "0.02em",
+                                                color: "var(--text-normal)",
+                                            }}
+                                        >
+                                            {prettyCategoryName(category.name)}
+                                        </div>
+                                    )}
+
                                     <div
                                         style={{
                                             display: "grid",
@@ -280,19 +619,13 @@ function StickerPickerModal({ modalProps }: { modalProps: any; }) {
                                         }}
                                     >
                                         {entries.map(entry => (
-                                            <img
+                                            <StickerImage
                                                 key={entry.relPath}
-                                                src={entry.dataUrl}
-                                                title={entry.name}
+                                                folder={folder}
+                                                entry={entry}
+                                                favorite={favoriteSet.has(entry.relPath)}
                                                 onClick={() => send(entry)}
-                                                style={{
-                                                    width: 80,
-                                                    height: 80,
-                                                    objectFit: "contain",
-                                                    cursor: "pointer",
-                                                    borderRadius: 8,
-                                                    background: "var(--background-secondary)",
-                                                }}
+                                                onToggleFavorite={() => toggleFavorite(entry.relPath)}
                                             />
                                         ))}
                                     </div>
@@ -312,6 +645,7 @@ function openStickerPicker() {
 
 const StickerChatBarIcon: ChatBarButton = ({ isMainChat }: any) => {
     if (!isMainChat) return null;
+
     return (
         <ChatBarButton tooltip="Stickers locaux" onClick={openStickerPicker}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
